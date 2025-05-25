@@ -60,13 +60,13 @@ function render(vm) {
   );
   $("#constants").el.append(...constants);
 
-  const instructions = vm.fn.prog.map((instr, i) =>
+  const instructions = vm.fn.code.map((instr, i) =>
     h("p", { class: "instruction" }, [i, instr.toString()])
   );
   $("#instructions").el.append(...instructions);
 
   const registers = vm.regs.map((r, i) =>
-    h("div", { class: "register" }, [i, r.value])
+    h("div", { class: "register" }, [i, r ? r.value : "null"])
   );
   $("#registers").el.append(...registers);
 }

@@ -1,18 +1,41 @@
+/// Virtual Machine
+// A simple register-based virtual machine that stores instructions as closures.
 class VM {
-  constructor(fn, regs, stack, pc) {
+  constructor(fn, regs, stack = [], pc = 0) {
     this.fn = fn;
-    this.regs = regs;
+    this.regs = Array(fn.size).fill(null);
     this.stack = stack;
     this.pc = pc;
+    this.regOffset = 0;
   }
-  static init(fn) {
-    return new VM(fn, [], [], 0);
+  /// local variables
+  testRegIndex(i) {
+    if (i < 0 || i >= this.fn.size)
+      throw new Error(`Invalid register index ${i}`);
   }
-  mkReg() {
-    const reg = this.regs.length;
-    this.regs.push(null);
-    return reg;
+  testConstIndex(i) {
+    const j = -i - 1;
+    if (j < 0 || j >= this.fn.consts.length)
+      throw new Error(`Invalid constant index ${i}`);
   }
+  getLocal(i) {
+    this.testRegIndex(i);
+    return this.regs[i];
+  }
+  setLocal(i, value) {
+    this.testRegIndex(i);
+    this.regs[i] = value;
+  }
+  getConst(i) {
+    this.testConstIndex(i);
+    return this.fn.consts[-i - 1];
+  }
+  getVal(i) {
+    if (i < 0) return this.getConst(i);
+    else return this.getLocal(i);
+  }
+
+  /// stepping
   step() {
     const instr = this.fn.getInstr(this.pc);
     if (instr === null) return false;
@@ -22,15 +45,17 @@ class VM {
 }
 
 class FnFrame {
-  constructor(in_count, out_count, consts, prog) {
-    this.consts = consts;
+  constructor(in_count, out_count, size, consts, locals, code) {
     this.in_count = in_count;
     this.out_count = out_count;
-    this.prog = prog;
+    this.size = size;
+    this.consts = consts;
+    this.locals = locals;
+    this.code = code;
   }
   getInstr(pc) {
-    if (pc >= this.prog.length) return null;
-    return this.prog[pc];
+    if (pc >= this.code.length) return null;
+    return this.code[pc];
   }
 }
 
@@ -57,29 +82,174 @@ function mkInstr(name, gen) {
     toString: () => `${name} ${args.join(", ")}`,
   });
 }
+const iMOVE = mkInstr("MOVE", (a, b) => (vm) => {
+  vm.setLocal(a, vm.getVal(b));
+  vm.pc++;
+});
 const iLOADK = mkInstr("LOADK", (a, k) => (vm) => {
-  vm.regs[a] = vm.fn.consts[k];
+  vm.setLocal(a, vm.getConst(k));
   vm.pc++;
 });
 const iADD = mkInstr("ADD", (a, b, c) => (vm) => {
-  const vb = vm.regs[b];
-  const vc = vm.regs[c];
+  const vb = vm.getVal(b);
+  const vc = vm.getVal(c);
   checkNum(vb);
   checkNum(vc);
-  vm.regs[a] = num(vb.value + vc.value);
+  vm.setLocal(a, num(vb.value + vc.value));
   vm.pc++;
 });
 
-// create a function by hand
-const testFn = new FnFrame(
-  0,
-  0,
-  [num(2), num(3)],
-  [
-    iLOADK(0, 0), // a = 2
-    iLOADK(1, 1), // b = 3
-    iADD(1, 0, 1), // b = a + b
-  ]
+/// Code generator
+
+class CodeGen {
+  constructor() {
+    this.consts = [];
+    this.code = [];
+    this.names = [];
+    this.locals = [];
+    this.temps = [];
+    this.lhs = null;
+  }
+  pushLocal(name) {
+    const l = this.names.length;
+    this.names.push(name);
+    this.locals.push(l);
+    return l;
+  }
+  pushTemp() {
+    const l = this.names.length;
+    this.names.push(`temp${l}`);
+    this.temps.push(l);
+    return l;
+  }
+  pushConst(value) {
+    const l = this.consts.length;
+    this.consts.push(value);
+    return -l - 1;
+  }
+  withLHS(i, fn) {
+    const old = this.lhs;
+    this.lhs = i;
+    const value = fn();
+    this.lhs = old;
+    return value;
+  }
+  emit(instr, ...args) {
+    this.code.push((remap) => instr(...args.map(remap)));
+  }
+  getRegMap() {
+    const regMap = Array(this.names.length);
+    for (let i = 0; i < this.locals.length; i++) regMap[this.locals[i]] = i;
+    for (let i = 0; i < this.temps.length; i++)
+      regMap[this.temps[i]] = this.locals.length + i;
+    return regMap;
+  }
+  getLocals() {
+    return this.locals.map((i) => this.names[i]);
+  }
+  getCode() {
+    const regMap = this.getRegMap();
+    return this.code.map((instr) => instr((i) => (i < 0 ? i : regMap[i])));
+  }
+}
+/**
+ * Creates an AST node.
+ * @param {string} name - The name of the node.
+ * @param {function(...*): function(CodeGen): void} gen - A generator function that returns the node's code generation.
+ * @param {function(...*): string} toString - A function that returns the string representation of the node.
+ * @returns {function(...*): {name: string, do: function(CodeGen): void, toString: () => string}} A function that returns an instruction object.
+ */
+function mkNode(name, gen, toString) {
+  return (...args) => ({
+    name,
+    do: gen(...args),
+    toString: () => toString(...args),
+  });
+}
+
+const con = mkNode("const", (value) => (gen) => {
+  const c = gen.pushConst(value);
+  gen.emit(iLOADK, gen.lhs, c);
+});
+
+const add = mkNode("add", (lhs, rhs) => (gen) => {
+  const t = gen.pushTemp();
+  gen.withLHS(t, () => lhs.do(gen));
+  rhs.do(gen);
+  gen.emit(iADD, gen.lhs, t, gen.lhs);
+});
+
+const leti = mkNode(
+  "let",
+  (name) => (gen) => {
+    for (let i = 0; i < gen.names.length; i++) {
+      if (gen.names[i] === name)
+        throw new Error(`Variable ${name} is already defined`);
+    }
+    gen.pushLocal(name);
+  },
+  (name, value) => `let ${name} = ${value}`
 );
-const vm = VM.init(testFn);
+
+const vari = mkNode(
+  "var",
+  (name) => (gen) => {
+    for (let i = 0; i < gen.names.length; i++) {
+      if (gen.names[i] !== name) continue;
+      if (gen.lhs !== i) gen.emit(iMOVE, gen.lhs, i);
+      return;
+    }
+    throw new Error(`Variable ${name} is not defined`);
+  },
+  (name) => name
+);
+
+const set = mkNode(
+  "set",
+  (name, value) => (gen) => {
+    for (let i = 0; i < gen.names.length; i++) {
+      if (gen.names[i] !== name) continue;
+      gen.withLHS(i, () => value.do(gen));
+      return;
+    }
+    throw new Error(`Variable ${name} is not defined`);
+  },
+  (name, value) => `${name} = ${value}`
+);
+
+const block = mkNode(
+  "block",
+  (body) => (gen) => {
+    if (body.length === 0) throw new Error("Empty block");
+    let result = null;
+    for (const expr of body) {
+      result = expr.do(gen);
+    }
+    return result;
+  },
+  (body) => `{ ${body.join("; ")} }`
+);
+
+function compile(node) {
+  const gen = new CodeGen();
+  node.do(gen);
+  const fn = new FnFrame(
+    0, 
+    0,
+    gen.names.length,
+    gen.consts, 
+    gen.getLocals(), 
+    gen.getCode()
+  );
+  return fn;
+}
+
+const testFn = block([
+  leti("a"),
+  set("a", add(con(num(2)), con(num(2)))),
+  leti("b"),
+  set("b", add(con(num(3)), vari("a"))),
+  set("a", add(vari("a"), vari("b"))),
+]);
+const vm = new VM(compile(testFn));
 console.log(vm);
