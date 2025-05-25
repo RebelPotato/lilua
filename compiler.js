@@ -135,7 +135,7 @@ class CodeGen {
     return value;
   }
   emit(instr, ...args) {
-    this.code.push((remap) => instr(...args.map(remap)));
+    this.code.push({ instr, args });
   }
   getRegMap() {
     const regMap = Array(this.names.length);
@@ -149,7 +149,9 @@ class CodeGen {
   }
   getCode() {
     const regMap = this.getRegMap();
-    return this.code.map((instr) => instr((i) => (i < 0 ? i : regMap[i])));
+    return this.code.map(({ instr, args }) =>
+      instr(...args.map((i) => (i < 0 ? i : regMap[i])))
+    );
   }
 }
 /**
@@ -234,11 +236,11 @@ function compile(node) {
   const gen = new CodeGen();
   node.do(gen);
   const fn = new FnFrame(
-    0, 
+    0,
     0,
     gen.names.length,
-    gen.consts, 
-    gen.getLocals(), 
+    gen.consts,
+    gen.getLocals(),
     gen.getCode()
   );
   return fn;
