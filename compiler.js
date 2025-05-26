@@ -103,29 +103,29 @@ const iADD = mkInstr("ADD", (a, b, c) => (vm) => {
 
 class CodeGen {
   constructor() {
-    this.consts = [];
-    this.code = [];
-    this.names = [];
-    this.locals = [];
-    this.temps = [];
+    this.consts = []; // constants
+    this.code = []; // instructions
+    this.locals = []; // names of locals
+    this.tempCount = 0; // temporary variable in use
+    this.maxTemp = 0; // maximum number of temporary variables
+    this.stack = []; // stack for return values
     this.lhs = null;
   }
   pushLocal(name) {
-    const l = this.names.length;
-    this.names.push(name);
-    this.locals.push(l);
-    return l;
-  }
-  pushTemp() {
-    const l = this.names.length;
-    this.names.push(`temp${l}`);
-    this.temps.push(l);
+    const l = this.locals.length;
+    this.locals.push(name);
     return l;
   }
   pushConst(value) {
     const l = this.consts.length;
     this.consts.push(value);
     return -l - 1;
+  }
+  withTemp(fn) {
+    this.tempCount++;
+    if (this.tempCount > this.maxTemp) this.maxTemp = this.tempCount;
+    fn({ type: "temp", index: this.tempCount - 1 });
+    this.tempCount--;
   }
   withLHS(i, fn) {
     const old = this.lhs;
@@ -137,21 +137,19 @@ class CodeGen {
   emit(instr, ...args) {
     this.code.push({ instr, args });
   }
-  getRegMap() {
-    const regMap = Array(this.names.length);
-    for (let i = 0; i < this.locals.length; i++) regMap[this.locals[i]] = i;
-    for (let i = 0; i < this.temps.length; i++)
-      regMap[this.temps[i]] = this.locals.length + i;
-    return regMap;
-  }
-  getLocals() {
-    return this.locals.map((i) => this.names[i]);
-  }
-  getCode() {
-    const regMap = this.getRegMap();
-    return this.code.map(({ instr, args }) =>
-      instr(...args.map((i) => (i < 0 ? i : regMap[i])))
+  mkFrame() {
+    const size = this.locals.length + this.maxTemp;
+    const code = this.code.map(({ instr, args }) =>
+      instr(
+        ...args.map((x) => {
+          if (x.type === "temp") return x.index + this.locals.length;
+          if (x.type === "local") return x.index;
+          if (x.type === "const") return x.value;
+          throw new Error(`Unknown type ${x.type} in instruction arguments`);
+        })
+      )
     );
+    return new FnFrame(0, 0, size, this.consts, this.locals, code);
   }
 }
 /**
@@ -171,24 +169,37 @@ function mkNode(name, gen, toString) {
 
 const con = mkNode("const", (value) => (gen) => {
   const c = gen.pushConst(value);
-  gen.emit(iLOADK, gen.lhs, c);
+  gen.stack.push({ type: "const", value: c });
 });
 
 const add = mkNode("add", (lhs, rhs) => (gen) => {
-  const t = gen.pushTemp();
-  gen.withLHS(t, () => lhs.do(gen));
-  rhs.do(gen);
-  gen.emit(iADD, gen.lhs, t, gen.lhs);
+  lhs.do(gen);
+  const l = gen.stack.pop();
+  gen.withTemp((t) => {
+    gen.withLHS(t, () => rhs.do(gen));
+    const r = gen.stack.pop();
+    gen.emit(iADD, gen.lhs, l, r);
+    gen.stack.push(gen.lhs);
+  });
+  // gen.emit(iADD, gen.lhs, t, gen.lhs);
 });
 
 const leti = mkNode(
   "let",
-  (name) => (gen) => {
-    for (let i = 0; i < gen.names.length; i++) {
-      if (gen.names[i] === name)
+  (name, value) => (gen) => {
+    for (let i = 0; i < gen.locals.length; i++) {
+      if (gen.locals[i] === name)
         throw new Error(`Variable ${name} is already defined`);
     }
-    gen.pushLocal(name);
+    const i = gen.pushLocal(name);
+    const l = { type: "local", index: i };
+    gen.withLHS(l, () => {
+      value.do(gen);
+      const v = gen.stack.pop();
+      if (v.type === "const") gen.emit(iLOADK, i, v);
+      else if (v.type !== "local" || v.index !== l.index) gen.emit(iMOVE, i, v);
+      gen.stack.push(l);
+    });
   },
   (name, value) => `let ${name} = ${value}`
 );
@@ -196,9 +207,9 @@ const leti = mkNode(
 const vari = mkNode(
   "var",
   (name) => (gen) => {
-    for (let i = 0; i < gen.names.length; i++) {
-      if (gen.names[i] !== name) continue;
-      if (gen.lhs !== i) gen.emit(iMOVE, gen.lhs, i);
+    for (let i = 0; i < gen.locals.length; i++) {
+      if (gen.locals[i] !== name) continue;
+      gen.stack.push({ type: "local", index: i });
       return;
     }
     throw new Error(`Variable ${name} is not defined`);
@@ -209,9 +220,17 @@ const vari = mkNode(
 const set = mkNode(
   "set",
   (name, value) => (gen) => {
-    for (let i = 0; i < gen.names.length; i++) {
-      if (gen.names[i] !== name) continue;
-      gen.withLHS(i, () => value.do(gen));
+    for (let i = 0; i < gen.locals.length; i++) {
+      if (gen.locals[i] !== name) continue;
+      const l = { type: "local", index: i };
+      gen.withLHS(l, () => {
+        value.do(gen);
+        const v = gen.stack.pop();
+        if (v.type === "const") gen.emit(iLOADK, i, v);
+        else if (v.type !== "local" || v.index !== l.index)
+          gen.emit(iMOVE, i, v);
+        gen.stack.push(l);
+      });
       return;
     }
     throw new Error(`Variable ${name} is not defined`);
@@ -225,9 +244,10 @@ const block = mkNode(
     if (body.length === 0) throw new Error("Empty block");
     let result = null;
     for (const expr of body) {
-      result = expr.do(gen);
+      expr.do(gen);
+      result = gen.stack.pop();
     }
-    return result;
+    gen.stack.push(result);
   },
   (body) => `{ ${body.join("; ")} }`
 );
@@ -235,22 +255,12 @@ const block = mkNode(
 function compile(node) {
   const gen = new CodeGen();
   node.do(gen);
-  const fn = new FnFrame(
-    0,
-    0,
-    gen.names.length,
-    gen.consts,
-    gen.getLocals(),
-    gen.getCode()
-  );
-  return fn;
+  return gen.mkFrame();
 }
 
 const testFn = block([
-  leti("a"),
-  set("a", add(con(num(2)), con(num(2)))),
-  leti("b"),
-  set("b", add(con(num(3)), vari("a"))),
+  leti("a", add(con(num(2)), con(num(2)))),
+  leti("b", add(con(num(3)), vari("a"))),
   set("a", add(vari("a"), vari("b"))),
 ]);
 const vm = new VM(compile(testFn));
