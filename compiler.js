@@ -1,7 +1,7 @@
 /// Virtual Machine
 // A simple register-based virtual machine that stores instructions as closures.
 class VM {
-  constructor(fn, regs, stack = [], pc = 0) {
+  constructor(fn, stack = [], pc = 0) {
     this.fn = fn;
     this.regs = Array(fn.size).fill(null);
     this.stack = stack;
@@ -44,7 +44,7 @@ class VM {
   }
 }
 
-class FnFrame {
+class Frame {
   constructor(in_count, out_count, size, consts, locals, code) {
     this.in_count = in_count;
     this.out_count = out_count;
@@ -60,12 +60,10 @@ class FnFrame {
 }
 
 function checkNum(x) {
-  return x.match({
-    Num: (x) => x,
-    _: () => {
-      throw new Error("Expected a number");
-    },
-  });
+  if (x.type !== "Num") {
+    throw new Error(`Expected a number, got ${x.type}`);
+  }
+  return x;
 }
 
 /// Instructions
@@ -107,7 +105,7 @@ class CodeGen {
     this.code = []; // instructions
     this.locals = []; // names of locals
     this.tempCount = 0; // temporary variable in use
-    this.maxTemp = 0; // maximum number of temporary variables
+    this.maxTemp = -1; // maximum number of temporary variables
     this.stack = []; // stack for return values
     this.lhs = null;
   }
@@ -123,9 +121,11 @@ class CodeGen {
   }
   withTemp(fn) {
     this.tempCount++;
-    if (this.tempCount > this.maxTemp) this.maxTemp = this.tempCount;
     fn({ type: "temp", index: this.tempCount - 1 });
     this.tempCount--;
+  }
+  updateMaxTemp(t) {
+    if (t.index > this.maxTemp) this.maxTemp = t.index;
   }
   withLHS(i, fn) {
     const old = this.lhs;
@@ -135,10 +135,13 @@ class CodeGen {
     return value;
   }
   emit(instr, ...args) {
+    for (const arg of args) {
+      if (arg.type === "temp") this.updateMaxTemp(arg);
+    }
     this.code.push({ instr, args });
   }
   mkFrame() {
-    const size = this.locals.length + this.maxTemp;
+    const size = this.locals.length + this.maxTemp + 1;
     const code = this.code.map(({ instr, args }) =>
       instr(
         ...args.map((x) => {
@@ -149,7 +152,7 @@ class CodeGen {
         })
       )
     );
-    return new FnFrame(0, 0, size, this.consts, this.locals, code);
+    return new Frame(0, 0, size, this.consts, this.locals, code);
   }
 }
 /**
@@ -168,6 +171,11 @@ function mkNode(name, gen, toString) {
 }
 
 const con = mkNode("const", (value) => (gen) => {
+  for (let i = 0; i < gen.consts.length; i++) {
+    if (!veq(gen.consts[i], value)) continue;
+    gen.stack.push({ type: "const", value: -i - 1 });
+    return;
+  }
   const c = gen.pushConst(value);
   gen.stack.push({ type: "const", value: c });
 });
@@ -196,8 +204,8 @@ const leti = mkNode(
     gen.withLHS(l, () => {
       value.do(gen);
       const v = gen.stack.pop();
-      if (v.type === "const") gen.emit(iLOADK, i, v);
-      else if (v.type !== "local" || v.index !== l.index) gen.emit(iMOVE, i, v);
+      if (v.type === "const") gen.emit(iLOADK, l, v);
+      else if (v.type !== "local" || v.index !== l.index) gen.emit(iMOVE, l, v);
       gen.stack.push(l);
     });
   },
@@ -226,9 +234,9 @@ const set = mkNode(
       gen.withLHS(l, () => {
         value.do(gen);
         const v = gen.stack.pop();
-        if (v.type === "const") gen.emit(iLOADK, i, v);
+        if (v.type === "const") gen.emit(iLOADK, l, v);
         else if (v.type !== "local" || v.index !== l.index)
-          gen.emit(iMOVE, i, v);
+          gen.emit(iMOVE, l, v);
         gen.stack.push(l);
       });
       return;
@@ -262,6 +270,8 @@ const testFn = block([
   leti("a", add(con(num(2)), con(num(2)))),
   leti("b", add(con(num(3)), vari("a"))),
   set("a", add(vari("a"), vari("b"))),
+  set("b", add(vari("b"), add(vari("a"), vari("b")))),
+  leti("c", vari("b")),
 ]);
 const vm = new VM(compile(testFn));
 console.log(vm);

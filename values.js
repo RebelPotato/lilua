@@ -21,11 +21,25 @@ function mkADT(name, ...argNames) {
 }
 
 // values
-const Num = mkADT("Num", "value");
-const Bool = mkADT("Bool", "value");
-const Nil = mkADT("Nil");
+const Num = (value) => ({type: "Num", value, toString: () => value.toString()});
+const Bool = (value) => ({type: "Bool", value, toString: () => value.toString()});
+const Nil = {type: "Nil", toString: () => "nil"};
 
-const num = (value) => Num({ value });
+const num = Num;
+
+function veq(a, b) {
+  if (a.type !== b.type) return false;
+  switch (a.type) {
+    case "Num":
+      return a.value === b.value;
+    case "Bool":
+      return a.value === b.value;
+    case "Nil":
+      return true;
+    default:
+      throw new Error(`Unknown type: ${a.type}`);
+  }
+}
 
 class Env {
   constructor() {
